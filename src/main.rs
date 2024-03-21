@@ -1,5 +1,5 @@
-mod fir_module;
 mod counting_mpsc;
+mod fir_module;
 mod throttle_module;
 use fir_module::FirFilter;
 
@@ -9,7 +9,6 @@ use std::fs;
 use std::io;
 use std::str::FromStr;
 use std::sync::{mpsc, Arc, Mutex};
-use std::sync::atomic::{AtomicUsize};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,6 +23,8 @@ const FIR_IMPULSE_LEN: usize = 2046;
 const VOLUME_SCALAR: f32 = 0.5;
 
 const INPUT_CHANNEL_MAPPING: [usize; NUM_FIR_CHANNELS] = [1, 1, 1, 0, 0, 0, 0, 0];
+
+type FirSample = [f32; NUM_FIR_CHANNELS];
 
 enum RunResult {
     Quit,
@@ -59,8 +60,8 @@ fn main() {
 }
 
 fn run_fir_thread() -> (
-    counting_mpsc::Sender<[f32; NUM_FIR_CHANNELS]>,
-    counting_mpsc::Receiver<[f32; NUM_FIR_CHANNELS]>,
+    counting_mpsc::Sender<FirSample>,
+    counting_mpsc::Receiver<FirSample>,
 ) {
     let impulses: Vec<Vec<f32>> = vec![
         load_fir_impulse("impulse_tweeter_6_3_24.txt"),
@@ -71,14 +72,16 @@ fn run_fir_thread() -> (
         load_fir_impulse("impulse_woofer_6_3_24.txt"),
     ];
 
-    let (mut fir_input_tx, mut fir_input_rx) = counting_mpsc::channel::<[f32; NUM_FIR_CHANNELS]>();
+    let (fir_input_tx, mut fir_input_rx) = counting_mpsc::channel::<FirSample>();
     let (throttle_input_tx, throttle_output_rx) = throttle_module::new::<NUM_FIR_CHANNELS>();
 
     thread_priority::spawn(ThreadPriority::Max, move |_| {
         let mut fir = FirFilter::<NUM_FIR_CHANNELS>::new(impulses);
         loop {
             let sample = match fir_input_rx.recv() {
-                Err(_) => { break; } // channel closed
+                Err(_) => {
+                    break;
+                } // channel closed
                 Ok(sample) => sample,
             };
 
@@ -154,7 +157,6 @@ fn run(stdin_receiver: &mpsc::Receiver<String>) -> RunResult {
 
     output_stream.play().unwrap();
     input_stream.play().unwrap();
-
 
     let mut result = RunResult::Quit;
     let mut running = true;
@@ -233,34 +235,30 @@ impl SharedData {
 fn process_input_data(
     data: &[f32],
     shared_data: &Arc<Mutex<SharedData>>,
-    sender: &mut counting_mpsc::Sender<[f32; NUM_FIR_CHANNELS]>,
+    sender: &mut counting_mpsc::Sender<FirSample>,
 ) {
-    let mut shared_data = shared_data.lock().expect("Failed to lock shared data");
-
-    shared_data.input_buffer_timestamp = Instant::now();
+    {
+        (*shared_data.lock().expect("Failed to lock shared data")).input_buffer_timestamp =
+            Instant::now();
+    }
 
     let num_input_frames = data.len() / NUM_INPUT_CHANNELS;
 
     for frame in 0..num_input_frames {
-        let mut arr: [f32; NUM_FIR_CHANNELS] = [0.0; NUM_FIR_CHANNELS];
-
+        let mut arr: FirSample = [0.0; NUM_FIR_CHANNELS];
         for channel in 0..NUM_FIR_CHANNELS {
             let input_channel = INPUT_CHANNEL_MAPPING[channel];
             arr[channel] = data[frame * NUM_INPUT_CHANNELS + input_channel];
         }
 
         sender.send(arr).unwrap();
-
-//        if !(frame == (num_input_frames - 1) && arr == [0.0; NUM_FIR_CHANNELS]) {
-//            sender.send(arr).unwrap();
-//        }
     }
 }
 
 fn process_output_data(
     data: &mut [f32],
     shared_data: &Arc<Mutex<SharedData>>,
-    receiver: &mut counting_mpsc::Receiver<[f32; NUM_FIR_CHANNELS]>,
+    receiver: &mut counting_mpsc::Receiver<FirSample>,
 ) {
     let mut shared_data = shared_data.lock().expect("Failed to lock shared data");
     let num_output_frames = data.len() / NUM_OUTPUT_CHANNELS;
@@ -315,7 +313,7 @@ fn load_fir_impulse(filename: &str) -> Vec<f32> {
     return impulse;
 }
 
-fn print_interface(shared_data: &SharedData, buffer_count : usize) {
+fn print_interface(shared_data: &SharedData, buffer_count: usize) {
     execute!(io::stdout(), terminal::Clear(terminal::ClearType::All)).unwrap();
     execute!(io::stdout(), cursor::MoveTo(0, 0)).unwrap();
     println!("===== Tadeusz's FIR =====");
@@ -328,10 +326,10 @@ fn print_interface(shared_data: &SharedData, buffer_count : usize) {
         );
     }
 
-        println!(
-            "buffer frames: {}\nmissed samples: {}\nload: {:.1}%",
-            buffer_count,
-            shared_data.missed_sample_count,
-            0.0, // shared_data.fir.load_percentage(),
-        );
+    println!(
+        "buffer frames: {}\nmissed samples: {}\nload: {:.1}%",
+        buffer_count,
+        shared_data.missed_sample_count,
+        0.0, // shared_data.fir.load_percentage(),
+    );
 }

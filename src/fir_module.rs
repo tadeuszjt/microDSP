@@ -59,7 +59,7 @@ impl<const NUM_CHANNELS: usize> FirFilter<NUM_CHANNELS> {
         self.buffer.push_back(sample);
     }
 
-    pub fn buffer_len(&self) -> usize {
-        return self.buffer.len();
-    }
+    //    pub fn buffer_len(&self) -> usize {
+    //        return self.buffer.len();
+    //    }
 }
