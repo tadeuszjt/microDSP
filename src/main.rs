@@ -73,7 +73,7 @@ fn run_fir_thread() -> (
     ];
 
     let (fir_input_tx, mut fir_input_rx) = counting_mpsc::channel::<FirSample>();
-    let (throttle_input_tx, throttle_output_rx) = throttle_module::new::<NUM_FIR_CHANNELS>();
+    let (mut throttle_input_tx, throttle_output_rx) = throttle_module::channel::<FirSample>();
 
     thread_priority::spawn(ThreadPriority::Max, move |_| {
         let mut fir = FirFilter::<NUM_FIR_CHANNELS>::new(impulses);
