@@ -1,13 +1,19 @@
 mod counting_mpsc;
 mod fir_module;
+mod sample;
 mod throttle_module;
+mod anti_pop_module;
+
 use fir_module::FirFilter;
+use sample::Sample;
+use anti_pop_module::AntiPop;
 
 use thread_priority::*;
 
 use std::fs;
 use std::io;
 use std::str::FromStr;
+use std::sync::atomic;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,8 +29,6 @@ const FIR_IMPULSE_LEN: usize = 2046;
 const VOLUME_SCALAR: f32 = 0.5;
 
 const INPUT_CHANNEL_MAPPING: [usize; NUM_FIR_CHANNELS] = [1, 1, 1, 0, 0, 0, 0, 0];
-
-type FirSample = [f32; NUM_FIR_CHANNELS];
 
 enum RunResult {
     Quit,
@@ -60,8 +64,9 @@ fn main() {
 }
 
 fn run_fir_thread() -> (
-    counting_mpsc::Sender<FirSample>,
-    counting_mpsc::Receiver<FirSample>,
+    counting_mpsc::Sender<Sample<NUM_FIR_CHANNELS>>,
+    counting_mpsc::Receiver<Sample<NUM_FIR_CHANNELS>>,
+    Arc<atomic::AtomicU64>,
 ) {
     let impulses: Vec<Vec<f32>> = vec![
         load_fir_impulse("impulse_tweeter_6_3_24.txt"),
@@ -72,18 +77,26 @@ fn run_fir_thread() -> (
         load_fir_impulse("impulse_woofer_6_3_24.txt"),
     ];
 
-    let (fir_input_tx, mut fir_input_rx) = counting_mpsc::channel::<FirSample>();
-    let (mut throttle_input_tx, throttle_output_rx) = throttle_module::channel::<FirSample>();
+    let (fir_input_tx, mut fir_input_rx) = counting_mpsc::channel::<Sample<NUM_FIR_CHANNELS>>();
+    let (mut throttle_input_tx, throttle_output_rx) =
+        throttle_module::channel::<Sample<NUM_FIR_CHANNELS>>();
+
+    let mut start_instant = Instant::now();
+    let mut on_duration = Duration::new(0, 0);
+    let load_percentage = Arc::new(atomic::AtomicU64::new(0));
+    let load_percentage_clone = load_percentage.clone();
 
     thread_priority::spawn(ThreadPriority::Max, move |_| {
         let mut fir = FirFilter::<NUM_FIR_CHANNELS>::new(impulses);
-        loop {
+        for iter_count in 0.. {
             let sample = match fir_input_rx.recv() {
                 Err(_) => {
                     break;
                 } // channel closed
                 Ok(sample) => sample,
             };
+
+            let start = Instant::now();
 
             fir.push_sample(sample);
             match fir.pop_sample() {
@@ -92,10 +105,26 @@ fn run_fir_thread() -> (
                     throttle_input_tx.send(sample).unwrap();
                 }
             }
+
+            let end = Instant::now();
+            on_duration += end.duration_since(start);
+
+            if iter_count % SAMPLE_RATE == 0 {
+                let now = Instant::now();
+                let proportion = (on_duration.as_nanos() * 1000 * 1000)
+                    / now.duration_since(start_instant).as_nanos();
+
+                load_percentage.store(
+                    (proportion / 10000).try_into().unwrap(),
+                    atomic::Ordering::SeqCst,
+                );
+                start_instant = now;
+                on_duration = Duration::new(0, 0);
+            }
         }
     });
 
-    (fir_input_tx, throttle_output_rx)
+    (fir_input_tx, throttle_output_rx, load_percentage_clone)
 }
 
 fn run(stdin_receiver: &mpsc::Receiver<String>) -> RunResult {
@@ -132,8 +161,9 @@ fn run(stdin_receiver: &mpsc::Receiver<String>) -> RunResult {
     let shared_data_input = Arc::clone(&shared_data);
     let shared_data_output = Arc::clone(&shared_data);
 
-    let (mut fir_input_tx, mut fir_output_rx) = run_fir_thread();
+    let (mut fir_input_tx, mut fir_output_rx, load_percentage) = run_fir_thread();
     let fir_output_count = fir_output_rx.clone_count();
+
 
     let input_stream = input_device
         .build_input_stream(
@@ -178,7 +208,11 @@ fn run(stdin_receiver: &mpsc::Receiver<String>) -> RunResult {
                 return RunResult::StreamsStopped;
             }
 
-            print_interface(&shared_data, fir_output_count.get_count());
+            print_interface(
+                &shared_data,
+                fir_output_count.get_count(),
+                load_percentage.load(atomic::Ordering::SeqCst),
+            );
         }
 
         loop {
@@ -219,6 +253,7 @@ struct SharedData {
     output_buffer_timestamp: Instant,
     output_buffer_volumes: [f32; NUM_OUTPUT_CHANNELS],
     missed_sample_count: usize,
+    total_latency: Duration,
 }
 
 impl SharedData {
@@ -228,6 +263,7 @@ impl SharedData {
             output_buffer_timestamp: Instant::now(),
             output_buffer_volumes: [0.0; NUM_OUTPUT_CHANNELS],
             missed_sample_count: 0,
+            total_latency: Duration::new(0, 0),
         }
     }
 }
@@ -235,50 +271,75 @@ impl SharedData {
 fn process_input_data(
     data: &[f32],
     shared_data: &Arc<Mutex<SharedData>>,
-    sender: &mut counting_mpsc::Sender<FirSample>,
+    sender: &mut counting_mpsc::Sender<Sample<NUM_FIR_CHANNELS>>,
 ) {
     {
         (*shared_data.lock().expect("Failed to lock shared data")).input_buffer_timestamp =
             Instant::now();
     }
 
+    let start_timestamp = Instant::now();
     let num_input_frames = data.len() / NUM_INPUT_CHANNELS;
 
     for frame in 0..num_input_frames {
-        let mut arr: FirSample = [0.0; NUM_FIR_CHANNELS];
+        let mut arr = [0.0; NUM_FIR_CHANNELS];
         for channel in 0..NUM_FIR_CHANNELS {
             let input_channel = INPUT_CHANNEL_MAPPING[channel];
             arr[channel] = data[frame * NUM_INPUT_CHANNELS + input_channel];
         }
 
-        sender.send(arr).unwrap();
+        let timestamp = start_timestamp
+            + Duration::from_nanos(
+                ((Duration::new(1, 0).as_nanos() / SAMPLE_RATE as u128) as u64) * (frame as u64),
+            );
+
+        sender
+            .send(Sample {
+                data: arr,
+                timestamp: timestamp,
+            })
+            .unwrap();
     }
 }
 
 fn process_output_data(
     data: &mut [f32],
     shared_data: &Arc<Mutex<SharedData>>,
-    receiver: &mut counting_mpsc::Receiver<FirSample>,
+    receiver: &mut counting_mpsc::Receiver<Sample<NUM_FIR_CHANNELS>>,
 ) {
     let mut shared_data = shared_data.lock().expect("Failed to lock shared data");
     let num_output_frames = data.len() / NUM_OUTPUT_CHANNELS;
     shared_data.output_buffer_timestamp = Instant::now();
+
+    let start_timestamp = Instant::now();
 
     for frame in 0..num_output_frames {
         let sample = match receiver.try_recv() {
             Ok(sample) => sample,
             Err(mpsc::TryRecvError::Empty) => {
                 shared_data.missed_sample_count += 1;
-                [0.0; NUM_FIR_CHANNELS]
+                Sample {
+                    data: [0.0; NUM_FIR_CHANNELS],
+                    timestamp: Instant::now(),
+                }
             }
             Err(_) => {
                 assert!(false);
-                [0.0; NUM_FIR_CHANNELS]
+                Sample {
+                    data: [0.0; NUM_FIR_CHANNELS],
+                    timestamp: Instant::now(),
+                }
             }
         };
 
+        let timestamp = start_timestamp
+            + Duration::from_nanos(
+                ((Duration::new(1, 0).as_nanos() / SAMPLE_RATE as u128) as u64) * (frame as u64),
+            );
+        shared_data.total_latency = timestamp.duration_since(sample.timestamp);
+
         for channel in 0..NUM_OUTPUT_CHANNELS {
-            data[frame * NUM_OUTPUT_CHANNELS + channel] = sample[channel] * VOLUME_SCALAR;
+            data[frame * NUM_OUTPUT_CHANNELS + channel] = sample.data[channel] * VOLUME_SCALAR;
         }
     }
 
@@ -313,7 +374,7 @@ fn load_fir_impulse(filename: &str) -> Vec<f32> {
     return impulse;
 }
 
-fn print_interface(shared_data: &SharedData, buffer_count: usize) {
+fn print_interface(shared_data: &SharedData, buffer_count: usize, load_percentage: u64) {
     execute!(io::stdout(), terminal::Clear(terminal::ClearType::All)).unwrap();
     execute!(io::stdout(), cursor::MoveTo(0, 0)).unwrap();
     println!("===== Tadeusz's FIR =====");
@@ -327,9 +388,10 @@ fn print_interface(shared_data: &SharedData, buffer_count: usize) {
     }
 
     println!(
-        "buffer frames: {}\nmissed samples: {}\nload: {:.1}%",
+        "buffer frames: {}\nmissed samples: {}\nload: {}%\nlatency: {}ms",
         buffer_count,
         shared_data.missed_sample_count,
-        0.0, // shared_data.fir.load_percentage(),
+        load_percentage,
+        shared_data.total_latency.as_millis(),
     );
 }
